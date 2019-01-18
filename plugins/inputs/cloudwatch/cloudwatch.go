@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 
 	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go/service/ec2"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
@@ -38,6 +39,9 @@ type (
 		metricCache *MetricCache
 		windowStart time.Time
 		windowEnd   time.Time
+		ec2svc      ec2Svc
+		ec2Tags     *NameCache
+		attachments *NameCache
 	}
 
 	Metric struct {
@@ -59,6 +63,16 @@ type (
 	cloudwatchClient interface {
 		ListMetrics(*cloudwatch.ListMetricsInput) (*cloudwatch.ListMetricsOutput, error)
 		GetMetricStatistics(*cloudwatch.GetMetricStatisticsInput) (*cloudwatch.GetMetricStatisticsOutput, error)
+	}
+
+	NameCache struct {
+		TTL     time.Duration
+		Fetched time.Time
+		Name    map[string]string
+	}
+	ec2Svc interface {
+		DescribeTags(*ec2.DescribeTagsInput) (*ec2.DescribeTagsOutput, error)
+		DescribeVolumes(*ec2.DescribeVolumesInput) (*ec2.DescribeVolumesOutput, error)
 	}
 )
 
@@ -191,6 +205,9 @@ func (c *CloudWatch) Gather(acc telegraf.Accumulator) error {
 	if c.client == nil {
 		c.initializeCloudWatch()
 	}
+	if c.ec2svc == nil {
+		c.initializeEc2Svc()
+	}
 
 	metrics, err := SelectMetrics(c)
 	if err != nil {
@@ -321,6 +338,13 @@ func (c *CloudWatch) gatherMetric(
 		return err
 	}
 
+	if c.Namespace == "AWS/EC2" || c.Namespace == "AWS/EBS" {
+		c.fetchTags()
+	}
+	if c.Namespace == "AWS/EBS" {
+		c.fetchAttachments()
+	}
+
 	for _, point := range resp.Datapoints {
 		tags := map[string]string{
 			"region": c.Region,
@@ -329,6 +353,22 @@ func (c *CloudWatch) gatherMetric(
 
 		for _, d := range metric.Dimensions {
 			tags[snakeCase(*d.Name)] = *d.Value
+		}
+
+		if c.Namespace == "AWS/EC2" {
+			instance_id := tags["instance_id"]
+			if name, ok := c.ec2Tags.Name[instance_id]; ok {
+				tags["name"] = name
+			}
+		}
+		if c.Namespace == "AWS/EBS" {
+			volume_id := tags["volume_id"]
+			if instance_id, ok := c.attachments.Name[volume_id]; ok {
+				tags["instance_id"] = instance_id
+				if name, ok := c.ec2Tags.Name[instance_id]; ok {
+					tags["name"] = name
+				}
+			}
 		}
 
 		// record field for each statistic
@@ -433,4 +473,89 @@ func isSelected(name string, metric *cloudwatch.Metric, dimensions []*Dimension)
 		}
 	}
 	return true
+}
+
+func (c *CloudWatch) initializeEc2Svc() error {
+	credentialConfig := &internalaws.CredentialConfig{
+		Region:      c.Region,
+		AccessKey:   c.AccessKey,
+		SecretKey:   c.SecretKey,
+		RoleARN:     c.RoleARN,
+		Profile:     c.Profile,
+		Filename:    c.Filename,
+		Token:       c.Token,
+		EndpointURL: c.EndpointURL,
+	}
+	configProvider := credentialConfig.Credentials()
+
+	c.ec2svc = ec2.New(configProvider)
+	return nil
+}
+
+func (c *CloudWatch) fetchTags() (map[string]string, error) {
+	if c.ec2Tags != nil && c.ec2Tags.IsValid() {
+		return c.ec2Tags.Name, nil
+	}
+
+	input := &ec2.DescribeTagsInput{
+		Filters: []*ec2.Filter{
+			{
+				Name: aws.String("resource-type"),
+				Values: []*string{
+					aws.String("instance"),
+				},
+			},
+			{
+				Name: aws.String("key"),
+				Values: []*string{
+					aws.String("Name"),
+				},
+			},
+		},
+	}
+
+	result, err := c.ec2svc.DescribeTags(input)
+	if err != nil {
+		return nil, err
+	}
+	tags := make(map[string]string)
+	for _, tag := range result.Tags {
+		tags[*tag.ResourceId] = *tag.Value
+	}
+	c.ec2Tags = &NameCache{
+		Name:    tags,
+		Fetched: time.Now(),
+		TTL:     c.CacheTTL.Duration,
+	}
+
+	return tags, nil
+}
+
+func (c *CloudWatch) fetchAttachments() (map[string]string, error) {
+	if c.attachments != nil && c.attachments.IsValid() {
+		return c.attachments.Name, nil
+	}
+
+	input := &ec2.DescribeVolumesInput{}
+	result, err := c.ec2svc.DescribeVolumes(input)
+	if err != nil {
+		return nil, err
+	}
+	attachments := make(map[string]string)
+	for _, vol := range result.Volumes {
+		for _, att := range vol.Attachments {
+			attachments[*att.VolumeId] = *att.InstanceId
+		}
+	}
+	c.attachments = &NameCache{
+		Name:    attachments,
+		Fetched: time.Now(),
+		TTL:     c.CacheTTL.Duration,
+	}
+
+	return attachments, nil
+}
+
+func (c *NameCache) IsValid() bool {
+	return c.Name != nil && time.Since(c.Fetched) < c.TTL
 }
