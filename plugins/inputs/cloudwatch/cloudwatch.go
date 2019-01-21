@@ -40,8 +40,10 @@ type (
 		windowStart time.Time
 		windowEnd   time.Time
 		ec2svc      ec2Svc
+		ec2Ids      *NameCache
 		ec2Tags     *NameCache
 		attachments *NameCache
+		TagFilter   string `toml:"tag_filter"`
 	}
 
 	Metric struct {
@@ -131,6 +133,8 @@ func (c *CloudWatch) SampleConfig() string {
   ## maximum of 400. Optional - default value is 200.
   ## See http://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/cloudwatch_limits.html
   ratelimit = 200
+
+  # tag_filter = "Name=tag:Env,Values=production"
 
   ## Metrics to Pull (optional)
   ## Defaults to all Metrics in Namespace if nothing is provided
@@ -492,26 +496,95 @@ func (c *CloudWatch) initializeEc2Svc() error {
 	return nil
 }
 
+func (c *CloudWatch) fetchInstanceIds() ([]string, error) {
+	if c.ec2Ids != nil && c.ec2Ids.IsValid() {
+		instance_ids := []string{}
+		for k, _ := range c.ec2Ids.Name {
+			instance_ids = append(instance_ids, k)
+		}
+		return instance_ids, nil
+	}
+	filters := []*ec2.Filter{
+		{
+			Name: aws.String("resource-type"),
+			Values: []*string{
+				aws.String("instance"),
+			},
+		},
+	}
+	if c.TagFilter != "" {
+		cond := strings.SplitN(c.TagFilter, ",", 2)
+		if len(cond) == 2 {
+			name := strings.SplitN(cond[0], "=", 2)
+			values := strings.SplitN(cond[1], "=", 2)
+			if name[0] == "Name" && values[0] == "Values" {
+				filters = append(filters, &ec2.Filter{
+					Name:   aws.String(name[1]),
+					Values: aws.StringSlice(strings.Split(values[1], ",")),
+				})
+			}
+		}
+	} else {
+		filters = append(filters, &ec2.Filter{
+			Name: aws.String("key"),
+			Values: []*string{
+				aws.String("Name"),
+			},
+		})
+	}
+	input := &ec2.DescribeTagsInput{
+		Filters: filters,
+	}
+	result, err := c.ec2svc.DescribeTags(input)
+	if err != nil {
+		return nil, err
+	}
+	ids := make(map[string]string)
+	instance_ids := []string{}
+	for _, tag := range result.Tags {
+		ids[*tag.ResourceId] = *tag.Value
+		instance_ids = append(instance_ids, *tag.ResourceId)
+	}
+	c.ec2Ids = &NameCache{
+		Name:    ids,
+		Fetched: time.Now(),
+		TTL:     c.CacheTTL.Duration,
+	}
+	return instance_ids, nil
+}
+
 func (c *CloudWatch) fetchTags() (map[string]string, error) {
 	if c.ec2Tags != nil && c.ec2Tags.IsValid() {
 		return c.ec2Tags.Name, nil
 	}
 
-	input := &ec2.DescribeTagsInput{
-		Filters: []*ec2.Filter{
-			{
-				Name: aws.String("resource-type"),
-				Values: []*string{
-					aws.String("instance"),
-				},
-			},
-			{
-				Name: aws.String("key"),
-				Values: []*string{
-					aws.String("Name"),
-				},
+	filters := []*ec2.Filter{
+		{
+			Name: aws.String("resource-type"),
+			Values: []*string{
+				aws.String("instance"),
 			},
 		},
+		{
+			Name: aws.String("key"),
+			Values: []*string{
+				aws.String("Name"),
+			},
+		},
+	}
+	instance_ids, err := c.fetchInstanceIds()
+	if err != nil {
+		return nil, err
+	}
+	if len(instance_ids) > 0 {
+		filters = append(filters, &ec2.Filter{
+			Name:   aws.String("resource-id"),
+			Values: aws.StringSlice(instance_ids),
+		})
+	}
+
+	input := &ec2.DescribeTagsInput{
+		Filters: filters,
 	}
 
 	result, err := c.ec2svc.DescribeTags(input)
@@ -536,7 +609,24 @@ func (c *CloudWatch) fetchAttachments() (map[string]string, error) {
 		return c.attachments.Name, nil
 	}
 
+	instance_ids, err := c.fetchInstanceIds()
+	if err != nil {
+		return nil, err
+	}
+
+	filters := []*ec2.Filter{}
+
+	if len(instance_ids) > 0 {
+		filters = append(filters, &ec2.Filter{
+			Name:   aws.String("attachment.instance-id"),
+			Values: aws.StringSlice(instance_ids),
+		})
+	}
+
 	input := &ec2.DescribeVolumesInput{}
+	if len(filters) > 0 {
+		input.Filters = filters
+	}
 	result, err := c.ec2svc.DescribeVolumes(input)
 	if err != nil {
 		return nil, err
