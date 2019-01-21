@@ -209,6 +209,13 @@ func (c *CloudWatch) Gather(acc telegraf.Accumulator) error {
 		c.initializeEc2Svc()
 	}
 
+	if c.Namespace == "AWS/EC2" || c.Namespace == "AWS/EBS" {
+		c.fetchTags()
+	}
+	if c.Namespace == "AWS/EBS" {
+		c.fetchAttachments()
+	}
+
 	metrics, err := SelectMetrics(c)
 	if err != nil {
 		return err
@@ -336,13 +343,6 @@ func (c *CloudWatch) gatherMetric(
 	resp, err := c.client.GetMetricStatistics(params)
 	if err != nil {
 		return err
-	}
-
-	if c.Namespace == "AWS/EC2" || c.Namespace == "AWS/EBS" {
-		c.fetchTags()
-	}
-	if c.Namespace == "AWS/EBS" {
-		c.fetchAttachments()
 	}
 
 	for _, point := range resp.Datapoints {
