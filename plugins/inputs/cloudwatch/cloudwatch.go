@@ -41,7 +41,6 @@ type (
 		windowEnd   time.Time
 		ec2svc      ec2Svc
 		ec2Ids      *NameCache
-		ec2Tags     *NameCache
 		attachments *NameCache
 		TagFilter   string `toml:"tag_filter"`
 	}
@@ -70,9 +69,10 @@ type (
 	NameCache struct {
 		TTL     time.Duration
 		Fetched time.Time
-		Name    map[string]string
+		Name    map[string]*string
 	}
 	ec2Svc interface {
+		DescribeInstances(*ec2.DescribeInstancesInput) (*ec2.DescribeInstancesOutput, error)
 		DescribeTags(*ec2.DescribeTagsInput) (*ec2.DescribeTagsOutput, error)
 		DescribeVolumes(*ec2.DescribeVolumesInput) (*ec2.DescribeVolumesOutput, error)
 	}
@@ -202,6 +202,15 @@ func SelectMetrics(c *CloudWatch) ([]*cloudwatch.Metric, error) {
 			return nil, err
 		}
 	}
+	if c.TagFilter != "" {
+		var filtered []*cloudwatch.Metric
+		for _, m := range metrics {
+			if isTagMatched(c, m) {
+				filtered = append(filtered, m)
+			}
+		}
+		metrics = filtered
+	}
 	return metrics, nil
 }
 
@@ -214,7 +223,7 @@ func (c *CloudWatch) Gather(acc telegraf.Accumulator) error {
 	}
 
 	if c.Namespace == "AWS/EC2" || c.Namespace == "AWS/EBS" {
-		c.fetchTags()
+		c.fetchInstanceIds()
 	}
 	if c.Namespace == "AWS/EBS" {
 		c.fetchAttachments()
@@ -361,16 +370,20 @@ func (c *CloudWatch) gatherMetric(
 
 		if c.Namespace == "AWS/EC2" {
 			instance_id := tags["instance_id"]
-			if name, ok := c.ec2Tags.Name[instance_id]; ok {
-				tags["name"] = name
+			if name, ok := c.ec2Ids.Name[instance_id]; ok {
+				if name != nil {
+					tags["name"] = *name
+				}
 			}
 		}
 		if c.Namespace == "AWS/EBS" {
 			volume_id := tags["volume_id"]
 			if instance_id, ok := c.attachments.Name[volume_id]; ok {
-				tags["instance_id"] = instance_id
-				if name, ok := c.ec2Tags.Name[instance_id]; ok {
-					tags["name"] = name
+				tags["instance_id"] = *instance_id
+				if name, ok := c.ec2Ids.Name[*instance_id]; ok {
+					if name != nil {
+						tags["name"] = *name
+					}
 				}
 			}
 		}
@@ -504,14 +517,7 @@ func (c *CloudWatch) fetchInstanceIds() ([]string, error) {
 		}
 		return instance_ids, nil
 	}
-	filters := []*ec2.Filter{
-		{
-			Name: aws.String("resource-type"),
-			Values: []*string{
-				aws.String("instance"),
-			},
-		},
-	}
+	filters := []*ec2.Filter{}
 	if c.TagFilter != "" {
 		cond := strings.SplitN(c.TagFilter, ",", 2)
 		if len(cond) == 2 {
@@ -524,87 +530,40 @@ func (c *CloudWatch) fetchInstanceIds() ([]string, error) {
 				})
 			}
 		}
-	} else {
-		filters = append(filters, &ec2.Filter{
-			Name: aws.String("key"),
-			Values: []*string{
-				aws.String("Name"),
-			},
-		})
 	}
-	input := &ec2.DescribeTagsInput{
-		Filters: filters,
+	input := &ec2.DescribeInstancesInput{}
+	if len(filters) > 0 {
+		input.Filters = filters
 	}
-	result, err := c.ec2svc.DescribeTags(input)
+	result, err := c.ec2svc.DescribeInstances(input)
 	if err != nil {
 		return nil, err
 	}
-	ids := make(map[string]string)
+	tags := make(map[string]*string)
 	instance_ids := []string{}
-	for _, tag := range result.Tags {
-		ids[*tag.ResourceId] = *tag.Value
-		instance_ids = append(instance_ids, *tag.ResourceId)
+	for _, r := range result.Reservations {
+		for _, i := range r.Instances {
+			instance_ids = append(instance_ids, *i.InstanceId)
+			var name *string
+			for _, tag := range i.Tags {
+				if *tag.Key == "Name" {
+					name = tag.Value
+					break
+				}
+			}
+			// if Name tag is not found, name is nil
+			tags[*i.InstanceId] = name
+		}
 	}
 	c.ec2Ids = &NameCache{
-		Name:    ids,
+		Name:    tags,
 		Fetched: time.Now(),
 		TTL:     c.CacheTTL.Duration,
 	}
 	return instance_ids, nil
 }
 
-func (c *CloudWatch) fetchTags() (map[string]string, error) {
-	if c.ec2Tags != nil && c.ec2Tags.IsValid() {
-		return c.ec2Tags.Name, nil
-	}
-
-	filters := []*ec2.Filter{
-		{
-			Name: aws.String("resource-type"),
-			Values: []*string{
-				aws.String("instance"),
-			},
-		},
-		{
-			Name: aws.String("key"),
-			Values: []*string{
-				aws.String("Name"),
-			},
-		},
-	}
-	instance_ids, err := c.fetchInstanceIds()
-	if err != nil {
-		return nil, err
-	}
-	if len(instance_ids) > 0 {
-		filters = append(filters, &ec2.Filter{
-			Name:   aws.String("resource-id"),
-			Values: aws.StringSlice(instance_ids),
-		})
-	}
-
-	input := &ec2.DescribeTagsInput{
-		Filters: filters,
-	}
-
-	result, err := c.ec2svc.DescribeTags(input)
-	if err != nil {
-		return nil, err
-	}
-	tags := make(map[string]string)
-	for _, tag := range result.Tags {
-		tags[*tag.ResourceId] = *tag.Value
-	}
-	c.ec2Tags = &NameCache{
-		Name:    tags,
-		Fetched: time.Now(),
-		TTL:     c.CacheTTL.Duration,
-	}
-
-	return tags, nil
-}
-
-func (c *CloudWatch) fetchAttachments() (map[string]string, error) {
+func (c *CloudWatch) fetchAttachments() (map[string]*string, error) {
 	if c.attachments != nil && c.attachments.IsValid() {
 		return c.attachments.Name, nil
 	}
@@ -631,10 +590,10 @@ func (c *CloudWatch) fetchAttachments() (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	attachments := make(map[string]string)
+	attachments := make(map[string]*string)
 	for _, vol := range result.Volumes {
 		for _, att := range vol.Attachments {
-			attachments[*att.VolumeId] = *att.InstanceId
+			attachments[*att.VolumeId] = att.InstanceId
 		}
 	}
 	c.attachments = &NameCache{
@@ -648,4 +607,34 @@ func (c *CloudWatch) fetchAttachments() (map[string]string, error) {
 
 func (c *NameCache) IsValid() bool {
 	return c.Name != nil && time.Since(c.Fetched) < c.TTL
+}
+
+func isTagMatched(c *CloudWatch, metric *cloudwatch.Metric) bool {
+	if *metric.Namespace == "AWS/EC2" {
+		for _, d := range metric.Dimensions {
+			if *d.Name != "InstanceId" {
+				continue
+			}
+			instance_id := d.Value
+			if _, ok := c.ec2Ids.Name[*instance_id]; ok {
+				return true
+			}
+		}
+		return false
+	} else if *metric.Namespace == "AWS/EBS" {
+		for _, d := range metric.Dimensions {
+			if *d.Name != "VolumeId" {
+				continue
+			}
+			volume_id := d.Value
+			if instance_id, ok := c.attachments.Name[*volume_id]; ok {
+				if _, ok := c.ec2Ids.Name[*instance_id]; ok {
+					return true
+				}
+			}
+		}
+		return false
+	} else {
+		return true
+	}
 }
