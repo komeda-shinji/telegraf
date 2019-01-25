@@ -378,9 +378,13 @@ func (c *CloudWatch) gatherMetric(
 		}
 		if c.Namespace == "AWS/EBS" {
 			volume_id := tags["volume_id"]
-			if instance_id, ok := c.attachments.Name[volume_id]; ok {
-				tags["instance_id"] = *instance_id
-				if name, ok := c.ec2Ids.Name[*instance_id]; ok {
+			if attachment, ok := c.attachments.Name[volume_id]; ok {
+                                s := strings.Split(*attachment, ":")
+                                instance_id := s[0]
+                                device := s[1]
+				tags["instance_id"] = instance_id
+				tags["volume_name"] = device
+				if name, ok := c.ec2Ids.Name[instance_id]; ok {
 					if name != nil {
 						tags["name"] = *name
 					}
@@ -593,7 +597,8 @@ func (c *CloudWatch) fetchAttachments() (map[string]*string, error) {
 	attachments := make(map[string]*string)
 	for _, vol := range result.Volumes {
 		for _, att := range vol.Attachments {
-			attachments[*att.VolumeId] = att.InstanceId
+                        dev := *att.InstanceId + ":" + strings.TrimPrefix(*att.Device, "/dev/")
+			attachments[*att.VolumeId] = &dev
 		}
 	}
 	c.attachments = &NameCache{
@@ -601,7 +606,6 @@ func (c *CloudWatch) fetchAttachments() (map[string]*string, error) {
 		Fetched: time.Now(),
 		TTL:     c.CacheTTL.Duration,
 	}
-
 	return attachments, nil
 }
 
@@ -623,15 +627,12 @@ func isTagMatched(c *CloudWatch, metric *cloudwatch.Metric) bool {
 		return false
 	} else if *metric.Namespace == "AWS/EBS" {
 		for _, d := range metric.Dimensions {
-			if *d.Name != "VolumeId" {
-				continue
-			}
-			volume_id := d.Value
-			if instance_id, ok := c.attachments.Name[*volume_id]; ok {
-				if _, ok := c.ec2Ids.Name[*instance_id]; ok {
-					return true
-				}
-			}
+			if *d.Name == "VolumeId" {
+                                volume_id := d.Value
+                                if _, ok := c.attachments.Name[*volume_id]; ok {
+                                        return true
+                                }
+                        }
 		}
 		return false
 	} else {
